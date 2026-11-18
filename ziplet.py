@@ -91,19 +91,21 @@ def members_and_size(listing):
             if not sep or key in fields:
                 raise TaskError("归档成员清单存在歧义")
             fields[key] = value
-        name = fields.get("Path", "")
+        raw_name = fields.get("Path", "")
+        # Windows 版 7-Zip 可能使用反斜杠显示成员目录。
+        name = raw_name.replace("\\", "/") if os.name == "nt" else raw_name
         parts = name.split("/")
-        windows_path = PureWindowsPath(name)
+        windows_path = PureWindowsPath(raw_name)
         if (any(part in ("", ".", "..") for part in parts)
-                or windows_path.drive or "\\" in name or "\x00" in name
+                or windows_path.anchor or "\\" in name or "\x00" in name
                 or any(":" in part for part in parts)):
-            raise TaskError("归档包含非法成员路径")
+            raise TaskError(f"归档包含非法成员路径，拒绝绝对路径、越界段或非法分隔符：{raw_name!r}")
         if os.name == "nt" and any(
             PureWindowsPath(part).is_reserved() or part.endswith((" ", "."))
             or any(char in '<>"|?*' or ord(char) < 32 for char in part)
             for part in parts
         ):
-            raise TaskError("归档包含 Windows 不支持的成员路径")
+            raise TaskError(f"归档包含 Windows 不支持的成员路径：{raw_name!r}")
         attributes = fields.get("Attributes", "")
         if (any(("link" in key.lower() or "reparse" in key.lower())
                     and value not in ("", "-")
@@ -450,10 +452,15 @@ def process_task(engine, origin, source, kind, output, work, state, budget, part
     workspace = work / identifier
     journal = work / f"{identifier}.json"
     final = output / relative
+    print(f"{task}｜正在计算源归档指纹", flush=True)
     source_digest = file_digest(source, *parts)
     if final.exists() or is_redirected(final):
-        if is_redirected(final) or not final.is_dir() or not journal.is_file():
-            raise TaskError("输出路径冲突")
+        if is_redirected(final):
+            raise TaskError(f"输出路径冲突，已存在链接或目录联接点：{final}")
+        if not final.is_dir():
+            raise TaskError(f"输出路径冲突，已存在非目录文件：{final}")
+        if not journal.is_file():
+            raise TaskError(f"输出路径冲突，已有目录缺少 Ziplet 任务记录：{final}")
         recorded = json.loads(journal.read_text(encoding="utf-8"))
         if recorded != {"source": source_digest, "files": output_manifest(final)}:
             raise TaskError("现有输出与任务记录不符")

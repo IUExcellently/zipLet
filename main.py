@@ -1,7 +1,10 @@
 import argparse
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 import os
 from pathlib import Path
 import sys
+import traceback
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -77,7 +80,7 @@ def read_config(config, password_file):
     return source, output, workers, [password for password in passwords if password]
 
 
-def main():
+def run_cli():
     argparse.ArgumentParser(description="递归解压归档并校验和保存媒体").parse_args()
     try:
         config_file = PROJECT_DIR / "ziplet.conf"
@@ -98,6 +101,45 @@ def main():
     except (OSError, ValueError) as error:
         print(f"运行失败：{error}", file=sys.stderr)
         return 1
+
+
+class RunLog:
+    def __init__(self, console, file):
+        self.console = console
+        self.file = file
+
+    def write(self, text):
+        self.file.write(text)
+        self.file.flush()
+        return self.console.write(text)
+
+    def flush(self):
+        self.file.flush()
+        self.console.flush()
+
+
+def main():
+    path = PROJECT_DIR / "ziplet-run.log"
+    try:
+        log = path.open("a", encoding="utf-8", errors="backslashreplace")
+    except OSError as error:
+        print(f"无法打开运行日志 {path}：{error}", file=sys.stderr)
+        return 1
+    with log, redirect_stdout(RunLog(sys.stdout, log)), redirect_stderr(RunLog(sys.stderr, log)):
+        print(f"\n=== Ziplet 开始运行 {datetime.now().astimezone().isoformat(timespec='seconds')} ===",
+              flush=True)
+        try:
+            status = run_cli()
+        except KeyboardInterrupt:
+            print("运行已由 Ctrl+C 中断", file=sys.stderr)
+            status = 130
+        except SystemExit as error:
+            status = error.code
+        except Exception:
+            traceback.print_exc()
+            status = 1
+        print(f"=== Ziplet 运行结束，退出码 {status} ===", flush=True)
+        return status
 
 
 if __name__ == "__main__":
