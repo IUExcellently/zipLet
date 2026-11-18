@@ -1,4 +1,3 @@
-import argparse
 from pathlib import Path
 import re
 import shutil
@@ -6,6 +5,10 @@ import sys
 
 from main import PROJECT_DIR, config_path, read_config_file
 from ziplet import is_redirected, lock_output
+
+
+# 确认预览结果后改为 True，再运行本文件执行删除。
+APPLY_CLEANUP = False
 
 
 def clean(apply):
@@ -59,15 +62,13 @@ def clean_workspaces(work: Path, apply: bool):
     if not matched:
         print("没有待清理的失败任务暂存目录")
     elif not apply:
-        print("当前仅预览。确认后加 --apply 执行清理。")
+        print("当前仅预览。确认后将文件顶部的 APPLY_CLEANUP 改为 True，再运行清理。")
     return 1 if errors else 0
 
 
 def main():
-    parser = argparse.ArgumentParser(description="清理 Ziplet 未发布任务留下的暂存目录")
-    parser.add_argument("--apply", action="store_true", help="实际删除暂存目录，默认仅预览")
     try:
-        return clean(parser.parse_args().apply)
+        return clean(APPLY_CLEANUP)
     except (OSError, ValueError) as error:
         print(f"无法清理：{error}", file=sys.stderr)
         return 1

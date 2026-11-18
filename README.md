@@ -41,11 +41,6 @@ Windows 会从 PATH 和 7-Zip 默认安装目录查找解压引擎。请使用�
 
 ### 清理失败任务
 
-关闭正在运行的 Ziplet，再从项目目录预览或清理暂存文件。Windows PowerShell 示例：
-
-```powershell
-py -3 cleanup_failed.py
-py -3 cleanup_failed.py --apply
-```
+关闭正在运行的 Ziplet，然后在 PyCharm 运行 `cleanup_failed.py`。脚本顶部的 `APPLY_CLEANUP = False` 默认仅预览。确认清单后改为 `APPLY_CLEANUP = True` 并重新运行，即可清理。清理完毕后改回 `False`，下次运行会重新预览。
 
 脚本读取 `ziplet.conf`，只处理输出目录 `.ziplet` 内没有发布记录的任务暂存目录。清理后这些任务需要重新解包。原始归档、已发布的媒体和密码命中记录会保留。
