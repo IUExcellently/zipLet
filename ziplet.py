@@ -46,7 +46,7 @@ def archive_type(path):
 
 
 def engine_call(engine, command, source, kind, password, *options, on_progress=None):
-    arguments = [engine, command, f"-t{kind}", "-sccUTF-8", "-y",
+    arguments = [engine, command, *([f"-t{kind}"] if kind else []), "-sccUTF-8", "-y",
                  f"-p{password}" if password else "-p", *options, "--", str(source)]
     try:
         with subprocess.Popen(
@@ -98,6 +98,12 @@ def members_and_size(listing):
                 or windows_path.drive or "\\" in name or "\x00" in name
                 or any(":" in part for part in parts)):
             raise TaskError("归档包含非法成员路径")
+        if os.name == "nt" and any(
+            PureWindowsPath(part).is_reserved() or part.endswith((" ", "."))
+            or any(char in '<>"|?*' or ord(char) < 32 for char in part)
+            for part in parts
+        ):
+            raise TaskError("归档包含 Windows 不支持的成员路径")
         attributes = fields.get("Attributes", "")
         if (any(("link" in key.lower() or "reparse" in key.lower())
                     and value not in ("", "-")
@@ -125,11 +131,12 @@ def members_and_size(listing):
     return members, total
 
 
-def file_digest(path):
+def file_digest(path, *remaining):
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
+    for part in (path, *remaining):
+        with part.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -145,23 +152,41 @@ def extracted_bytes(directory):
     return total
 
 
-def unpack(engine, source, kind, candidates, destination, budget, progress=None):
+def unpack(engine, source, kind, candidates, destination, budget, progress=None, parts=()):
     rejected = "密码候选耗尽"
+    engine_type = None if parts else kind
+    packed = sum(part.stat().st_size for part in (source, *parts)) if parts else 0
     for attempt, candidate in enumerate(candidates, 1):
         def report(status, written=0, total=None):
             if progress:
                 progress(f"尝试 {attempt}/{len(candidates)}｜{status}", written, total)
 
         report("检查归档")
-        listing = engine_call(engine, "l", source, kind, candidate, "-slt")
+        listing = engine_call(engine, "l", source, engine_type, candidate, "-slt")
         if listing.returncode:
             message = (listing.stdout + listing.stderr).lower()
             if "wrong password" in message or "password is incorrect" in message:
                 report("密码未通过，继续尝试")
                 continue
+            if parts:
+                # 旧版 7-Zip 读加密分卷时可能只返回通用的打开失败。
+                if kind == "7z" and "type = split" in message and "unexpected end" not in message:
+                    rejected = "分卷无法读取，可能是密码未命中、缺卷或归档损坏"
+                    report("分卷验证未通过，继续尝试")
+                    continue
+                raise TaskError("分卷无法读取，请检查缺卷或归档损坏")
             if "unexpected end" in message or "headers error" in message:
                 raise TaskError("归档损坏")
             raise TaskError("归档清单读取失败，原因未决")
+        if parts:
+            header = listing.stdout.replace("\r\n", "\n").partition("\n----------\n")[0]
+            types = re.findall(r"^Type = (.+)$", header, re.MULTILINE)
+            volumes = re.search(r"^Volumes = (\d+)$", header, re.MULTILINE)
+            physical = re.search(r"^Total Physical Size = (\d+)$", header, re.MULTILINE)
+            if (not physical or int(physical[1]) != packed
+                    or not types or types[0] != "Split" or types[-1].lower() != kind
+                    or not volumes or int(volumes[1]) != len(parts) + 1):
+                raise TaskError("分卷集不完整，或内层归档格式与首卷不符")
         members, size = members_and_size(listing.stdout)
         # 独立暂存目录避免错误密码写出的不完整文件混入下一次试验。
         with budget.reserve(size):
@@ -169,7 +194,7 @@ def unpack(engine, source, kind, candidates, destination, budget, progress=None)
             try:
                 report("解压中", total=size)
                 result = engine_call(
-                    engine, "x", source, kind, candidate, f"-o{destination}",
+                    engine, "x", source, engine_type, candidate, f"-o{destination}",
                     on_progress=(lambda: report("解压中", extracted_bytes(destination), size))
                     if progress else None,
                 )
@@ -265,16 +290,43 @@ class State:
                 self.hits.append(password)
 
 
-def walk_tree(engine, source, kind, workspace, task, state, budget):
-    pending = [(source, kind, Path(), 0, None)]
+def group_archive_files(paths):
+    groups = {}
+    singles = []
+    for path in paths:
+        match = re.fullmatch(r"(.+\.(?:7z|zip|rar|wim))\.(\d{3,})", path.name,
+                             re.IGNORECASE | re.ASCII)
+        if match:
+            base = path.with_name(match[1])
+            groups.setdefault(base, []).append((int(match[2]), path))
+        else:
+            singles.append(path)
+    yield from ((path, path, ()) for path in singles)
+    for base, entries in groups.items():
+        ordered = sorted(entries)
+        yield base, ordered[0][1], tuple(ordered)
+
+
+def archive_parts(base, entries):
+    if not entries:
+        return ()
+    if len(entries) < 2 or any(number != index for index, (number, _) in enumerate(entries, 1)):
+        raise TaskError(f"分卷缺失或编号重复：{base.name}")
+    if base.exists():
+        raise TaskError(f"分卷与现有文件重名：{base.name}")
+    return tuple(path for _, path in entries[1:])
+
+
+def walk_tree(engine, source, kind, workspace, task, state, budget, parts=()):
+    pending = [(source, kind, Path(), 0, None, parts)]
     media = {}
     step = 0
     while pending:
-        archive, current_kind, relative, depth, parent = pending.pop()
+        archive, current_kind, relative, depth, parent, parts = pending.pop()
         destination = workspace / str(step)
         step += 1
         member_path = relative.as_posix() if depth else task
-        packed = archive.stat().st_size
+        packed = sum(part.stat().st_size for part in (archive, *parts))
 
         def progress(status, written=0, total=None):
             expanded = f"{written:,} B"
@@ -282,7 +334,7 @@ def walk_tree(engine, source, kind, workspace, task, state, budget):
                 expanded += f" / {total:,} B"
             print(f"{task}｜第 {step} 轮 · 层级 {depth}｜{member_path}｜"
                   f"包大小 {packed:,} B｜已解压 {expanded}｜{status}", flush=True)
-        identity = (task, member_path, depth, file_digest(archive))
+        identity = (task, member_path, depth, file_digest(archive, *parts))
         checkpoint = workspace / f"{step - 1}.json"
         record = json.loads(checkpoint.read_text(encoding="utf-8")) if checkpoint.exists() else None
         temporary = destination.with_suffix(".partial")
@@ -303,7 +355,7 @@ def walk_tree(engine, source, kind, workspace, task, state, budget):
                 raise TaskError("中间工作目录与任务记录冲突")
             try:
                 candidate = unpack(engine, archive, current_kind,
-                                   state.candidates(identity, parent), temporary, budget, progress)
+                                   state.candidates(identity, parent), temporary, budget, progress, parts)
             except TaskError as error:
                 progress(f"异常：{error}")
                 raise
@@ -312,13 +364,15 @@ def walk_tree(engine, source, kind, workspace, task, state, budget):
                                    "files": output_manifest(temporary)})
             temporary.rename(destination)
         children = []
-        for item in sorted(destination.rglob("*")):
-            if item.is_dir():
-                continue
-            target = relative / item.relative_to(destination)
+        files = (item for item in sorted(destination.rglob("*")) if item.is_file())
+        for base, item, entries in group_archive_files(files):
+            target = relative / base.relative_to(destination)
+            parts = archive_parts(base, entries)
             detected = archive_type(item)
             if detected:
-                children.append((item, detected, target, depth + 1, candidate))
+                children.append((item, detected, target, depth + 1, candidate, parts))
+            elif parts:
+                raise TaskError(f"无法识别分卷首卷格式：{target}")
             else:
                 if target in media:
                     raise TaskError("解包结果路径冲突")
@@ -389,16 +443,16 @@ def save_json(path, record):
     temporary.replace(path)
 
 
-def process_task(engine, origin, source, kind, output, work, state, budget):
+def process_task(engine, origin, source, kind, output, work, state, budget, parts=()):
     relative = source.relative_to(origin)
     task = relative.as_posix()
     identifier = hashlib.sha256(os.fsencode(task)).hexdigest()
     workspace = work / identifier
     journal = work / f"{identifier}.json"
     final = output / relative
-    source_digest = file_digest(source)
-    if final.exists() or final.is_symlink():
-        if final.is_symlink() or not final.is_dir() or not journal.is_file():
+    source_digest = file_digest(source, *parts)
+    if final.exists() or is_redirected(final):
+        if is_redirected(final) or not final.is_dir() or not journal.is_file():
             raise TaskError("输出路径冲突")
         recorded = json.loads(journal.read_text(encoding="utf-8"))
         if recorded != {"source": source_digest, "files": output_manifest(final)}:
@@ -409,7 +463,7 @@ def process_task(engine, origin, source, kind, output, work, state, budget):
 
     with budget.reserve(0):
         workspace.mkdir(exist_ok=True)
-    media = walk_tree(engine, source, kind, workspace, task, state, budget)
+    media = walk_tree(engine, source, kind, workspace, task, state, budget, parts)
     staged = workspace / "publish"
     if staged.exists():
         shutil.rmtree(staged)
@@ -429,7 +483,7 @@ def process_task(engine, origin, source, kind, output, work, state, budget):
     if not seen:
         raise TaskError("归档未产出可校验的图片或视频")
 
-    if file_digest(source) != source_digest:
+    if file_digest(source, *parts) != source_digest:
         raise TaskError("运行期间源包发生变化")
     recorded = {"source": source_digest, "files": output_manifest(staged)}
     save_json(journal, recorded)
@@ -439,33 +493,77 @@ def process_task(engine, origin, source, kind, output, work, state, budget):
     return "媒体已发布，中间归档已清理"
 
 
+def find_engine():
+    engine = shutil.which("7zz") or shutil.which("7z")
+    if not engine and os.name == "nt":
+        for variable in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+            directory = os.environ.get(variable)
+            if directory:
+                candidate = Path(directory) / "7-Zip" / "7z.exe"
+                if candidate.is_file():
+                    return str(candidate)
+    return engine
+
+
+def is_redirected(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    # Windows 的目录联接点不一定被识别为符号链接。
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+@contextmanager
+def lock_output(path):
+    # 两个平台均在文件关闭时由系统释放锁。
+    with path.open("a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                raise ValueError("已有 Ziplet 进程使用此输出目录") from None
+        else:
+            import fcntl
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError("已有 Ziplet 进程使用此输出目录") from None
+        yield
+
+
 def run(origin, output, workers, passwords):
-    import fcntl
     try:
         from PIL import Image
     except ImportError:
         raise ValueError("请先安装 Pillow") from None
 
-    engine = shutil.which("7zz") or shutil.which("7z")
+    engine = find_engine()
     if not engine:
         raise ValueError("找不到 7zz 或 7z")
     output.mkdir(parents=True, exist_ok=True)
     work = output / ".ziplet"
     work.mkdir(mode=0o700, exist_ok=True)
-    if work.is_symlink() or work.stat().st_mode & 0o077:
+    if is_redirected(work) or (os.name != "nt" and work.stat().st_mode & 0o077):
         raise ValueError(".ziplet 工作目录须为仅当前用户可访问的实际目录")
-    with (work / "lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise ValueError("已有 Ziplet 进程使用此输出目录") from None
+    with lock_output(work / "lock"):
         state = State(work, passwords)
         budget = DiskBudget(work)
 
-        def process(source):
+        def process(group):
+            base, source, entries = group
             task = source.relative_to(origin).as_posix()
             try:
+                parts = archive_parts(base, entries)
                 kind = archive_type(source)
+                if parts and not kind:
+                    raise TaskError("无法识别分卷首卷格式")
                 if not kind:
                     print(f"{task}｜非目标文件", flush=True)
                     return True
@@ -474,9 +572,9 @@ def run(origin, output, workers, passwords):
                 for parent in (output / source.relative_to(origin)).parents:
                     if parent == output:
                         break
-                    if parent.is_symlink():
+                    if is_redirected(parent):
                         raise TaskError("输出父目录包含链接")
-                result = process_task(engine, origin, source, kind, output, work, state, budget)
+                result = process_task(engine, origin, source, kind, output, work, state, budget, parts)
                 print(f"{task}｜{result}", flush=True)
                 return True
             except (TaskError, OSError, ValueError, sqlite3.Error, zipfile.BadZipFile) as error:
@@ -491,5 +589,5 @@ def run(origin, output, workers, passwords):
 
         paths = (item for item in sorted(origin.rglob("*")) if not item.is_symlink() and item.is_file())
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            results = list(executor.map(process, paths))
+            results = list(executor.map(process, group_archive_files(paths)))
         return 0 if all(results) else 1

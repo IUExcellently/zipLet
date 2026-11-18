@@ -1,2 +1,5 @@
 zipPwd.txt
 /.ziplet-local/
+
+.env
+ziplet.conf
