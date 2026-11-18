@@ -445,6 +445,17 @@ def save_json(path, record):
     temporary.replace(path)
 
 
+def remove_source_archives(source, parts):
+    # 首卷最后处理，便于在部分分卷删除失败时识别原任务。
+    archives = (*reversed(parts), source)
+    for index, archive in enumerate(archives):
+        try:
+            archive.unlink()
+        except OSError:
+            names = "、".join(item.name for item in archives[index:])
+            raise TaskError(f"媒体已发布，但以下原档未能清理：{names}") from None
+
+
 def process_task(engine, origin, source, kind, output, work, state, budget, parts=()):
     relative = source.relative_to(origin)
     task = relative.as_posix()
@@ -462,11 +473,15 @@ def process_task(engine, origin, source, kind, output, work, state, budget, part
         if not journal.is_file():
             raise TaskError(f"输出路径冲突，已有目录缺少 Ziplet 任务记录：{final}")
         recorded = json.loads(journal.read_text(encoding="utf-8"))
-        if recorded != {"source": source_digest, "files": output_manifest(final)}:
+        published = output_manifest(final)
+        if not published or recorded != {"source": source_digest, "files": published}:
             raise TaskError("现有输出与任务记录不符")
+        if file_digest(source, *parts) != source_digest:
+            raise TaskError("校验期间源包发生变化")
         if workspace.exists():
             shutil.rmtree(workspace)
-        return "已验证现有输出"
+        remove_source_archives(source, parts)
+        return "已验证现有输出，原档已清理"
 
     with budget.reserve(0):
         workspace.mkdir(exist_ok=True)
@@ -497,7 +512,8 @@ def process_task(engine, origin, source, kind, output, work, state, budget, part
     final.parent.mkdir(parents=True, exist_ok=True)
     staged.rename(final)
     shutil.rmtree(workspace)
-    return "媒体已发布，中间归档已清理"
+    remove_source_archives(source, parts)
+    return "媒体已发布，中间归档和原档已清理"
 
 
 def find_engine():
@@ -545,7 +561,11 @@ def lock_output(path):
         yield
 
 
-def run(origin, output, workers, passwords):
+def run(origin, output, workers, passwords, max_new_archives=None):
+    if max_new_archives is not None and (
+        type(max_new_archives) is not int or max_new_archives < 0
+    ):
+        raise ValueError("MAX_NEW_ARCHIVES 必须是非负整数或 None")
     try:
         from PIL import Image
     except ImportError:
@@ -562,8 +582,11 @@ def run(origin, output, workers, passwords):
     with lock_output(work / "lock"):
         state = State(work, passwords)
         budget = DiskBudget(work)
+        batch_lock = Lock()
+        new_archives = 0
 
         def process(group):
+            nonlocal new_archives
             base, source, entries = group
             task = source.relative_to(origin).as_posix()
             try:
@@ -576,11 +599,18 @@ def run(origin, output, workers, passwords):
                     return True
                 if source.relative_to(origin).parts[0].casefold() == work.name:
                     raise TaskError("归档路径与工作目录冲突")
-                for parent in (output / source.relative_to(origin)).parents:
+                final = output / source.relative_to(origin)
+                for parent in final.parents:
                     if parent == output:
                         break
                     if is_redirected(parent):
                         raise TaskError("输出父目录包含链接")
+                if max_new_archives is not None and not (final.exists() or is_redirected(final)):
+                    with batch_lock:
+                        if new_archives >= max_new_archives:
+                            print(f"{task}｜已达本批新原包上限，留待下次处理", flush=True)
+                            return True
+                        new_archives += 1
                 result = process_task(engine, origin, source, kind, output, work, state, budget, parts)
                 print(f"{task}｜{result}", flush=True)
                 return True

@@ -7,6 +7,10 @@ import sys
 import traceback
 
 
+# 每次最多开始处理的最外层原包数量，None 表示不限。
+MAX_NEW_ARCHIVES = None
+
+
 PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_KEYS = {"ZIPLET_INPUT_DIR", "ZIPLET_OUTPUT_DIR", "ZIPLET_PASSWORD_FILE", "ZIPLET_MAX_WORKERS"}
 
@@ -97,7 +101,7 @@ def run_cli():
             return 1
         config = read_config(config, password_file)
         from ziplet import run
-        return run(*config)
+        return run(*config, max_new_archives=MAX_NEW_ARCHIVES)
     except (OSError, ValueError) as error:
         print(f"运行失败：{error}", file=sys.stderr)
         return 1
