@@ -123,12 +123,12 @@ def members_and_size(listing):
         normalized = unicodedata.normalize("NFC", name).casefold()
         if normalized in members:
             raise TaskError("归档包含重名成员")
-        members[normalized] = directory
+        members[normalized] = None if directory else int(size)
         if not directory:
             total += int(size)
     for name in members:
         parts = name.split("/")
-        if any(members.get("/".join(parts[:i])) is False for i in range(1, len(parts))):
+        if any(members.get("/".join(parts[:i])) is not None for i in range(1, len(parts))):
             raise TaskError("归档成员路径冲突")
     return members, total
 
@@ -212,13 +212,19 @@ def unpack(engine, source, kind, candidates, destination, budget, progress=None,
                     raise TaskError("解包失败，原因未决")
                 extracted = set()
                 for item in destination.rglob("*"):
-                    mode = item.lstat().st_mode
-                    name = unicodedata.normalize("NFC", item.relative_to(destination).as_posix()).casefold()
-                    if stat.S_ISREG(mode) and item.stat().st_nlink == 1 and members.get(name) is False:
+                    info = item.lstat()
+                    relative = item.relative_to(destination).as_posix()
+                    name = unicodedata.normalize("NFC", relative).casefold()
+                    expected = members.get(name)
+                    if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and expected is not None:
+                        if info.st_size != expected:
+                            raise TaskError(f"解压文件大小与归档清单不符：{relative!r}，"
+                                            f"实际 {info.st_size / 1e9:.9f} GB，"
+                                            f"预计 {expected / 1e9:.9f} GB")
                         extracted.add(name)
-                    elif not stat.S_ISDIR(mode):
+                    elif not stat.S_ISDIR(info.st_mode):
                         raise TaskError("解包产生未声明文件或特殊成员")
-                if extracted != {name for name, directory in members.items() if not directory}:
+                if extracted != {name for name, expected in members.items() if expected is not None}:
                     raise TaskError("解包结果与成员清单不符")
                 report("解压完成", extracted_bytes(destination), size)
                 encrypted = "Encrypted = +" in listing.stdout
@@ -331,11 +337,11 @@ def walk_tree(engine, source, kind, workspace, task, state, budget, parts=()):
         packed = sum(part.stat().st_size for part in (archive, *parts))
 
         def progress(status, written=0, total=None):
-            expanded = f"{written:,} B"
+            expanded = f"{written / 1_000_000_000:.3f} GB"
             if total is not None:
-                expanded += f" / {total:,} B"
+                expanded += f" / {total / 1_000_000_000:.3f} GB"
             print(f"{task}｜第 {step} 轮 · 层级 {depth}｜{member_path}｜"
-                  f"包大小 {packed:,} B｜已解压 {expanded}｜{status}", flush=True)
+                  f"包大小 {packed / 1_000_000_000:.3f} GB｜已解压 {expanded}｜{status}", flush=True)
         identity = (task, member_path, depth, file_digest(archive, *parts))
         checkpoint = workspace / f"{step - 1}.json"
         record = json.loads(checkpoint.read_text(encoding="utf-8")) if checkpoint.exists() else None
@@ -393,6 +399,8 @@ def valid_media(path):
     from PIL import Image, UnidentifiedImageError
 
     suffix = path.suffix.lower()
+    if path.stat().st_size == 0 and suffix in IMAGE_SUFFIXES | VIDEO_SUFFIXES:
+        raise TaskError(f"媒体文件为空，停止发布：{path.name!r}")
     try:
         with Image.open(path) as image:
             image.load()
@@ -428,13 +436,15 @@ def valid_media(path):
     return True
 
 
-def output_manifest(directory):
+def output_manifest(directory, require_nonempty=False):
     manifest = {}
     for item in sorted(directory.rglob("*")):
-        mode = item.lstat().st_mode
-        if stat.S_ISREG(mode):
+        info = item.lstat()
+        if stat.S_ISREG(info.st_mode):
+            if require_nonempty and info.st_size == 0:
+                raise TaskError(f"输出媒体为空：{item}")
             manifest[item.relative_to(directory).as_posix()] = file_digest(item)
-        elif not stat.S_ISDIR(mode):
+        elif not stat.S_ISDIR(info.st_mode):
             raise TaskError("输出包含链接或特殊文件")
     return manifest
 
@@ -443,6 +453,12 @@ def save_json(path, record):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
     temporary.replace(path)
+
+
+def log_published_files(task, final, files):
+    print(f"{task}｜最终输出目录：{final}", flush=True)
+    for relative in files:
+        print(f"{task}｜发布文件：{final / relative}", flush=True)
 
 
 def remove_source_archives(source, parts):
@@ -473,13 +489,14 @@ def process_task(engine, origin, source, kind, output, work, state, budget, part
         if not journal.is_file():
             raise TaskError(f"输出路径冲突，已有目录缺少 Ziplet 任务记录：{final}")
         recorded = json.loads(journal.read_text(encoding="utf-8"))
-        published = output_manifest(final)
+        published = output_manifest(final, require_nonempty=True)
         if not published or recorded != {"source": source_digest, "files": published}:
             raise TaskError("现有输出与任务记录不符")
         if file_digest(source, *parts) != source_digest:
             raise TaskError("校验期间源包发生变化")
         if workspace.exists():
             shutil.rmtree(workspace)
+        log_published_files(task, final, published)
         remove_source_archives(source, parts)
         return "已验证现有输出，原档已清理"
 
@@ -507,10 +524,11 @@ def process_task(engine, origin, source, kind, output, work, state, budget, part
 
     if file_digest(source, *parts) != source_digest:
         raise TaskError("运行期间源包发生变化")
-    recorded = {"source": source_digest, "files": output_manifest(staged)}
+    recorded = {"source": source_digest, "files": output_manifest(staged, require_nonempty=True)}
     save_json(journal, recorded)
     final.parent.mkdir(parents=True, exist_ok=True)
     staged.rename(final)
+    log_published_files(task, final, recorded["files"])
     shutil.rmtree(workspace)
     remove_source_archives(source, parts)
     return "媒体已发布，中间归档和原档已清理"
